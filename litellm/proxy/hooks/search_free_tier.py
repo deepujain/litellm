@@ -17,7 +17,7 @@ from litellm.types.utils import ModelInfo, SearchFreeRequests, StandardLoggingPa
 _PERIOD_DURATION: Final = MappingProxyType({"day": "1d", "month": "1mo"})
 _PERIOD_STAMP: Final = MappingProxyType({"day": "%Y-%m-%d", "month": "%Y-%m"})
 _TTL_GRACE_SECONDS: Final = 3600
-_COUNTED_KWARG: Final = "search_free_tier_counted"
+SEARCH_FREE_TIER_COUNTED_KWARG: Final = "search_free_tier_counted"
 
 
 class SharedCounter(Protocol):
@@ -65,7 +65,7 @@ def _billable_units(usage: Usage, model_info: ModelInfo) -> int:
     return queries if model_info.get("web_search_billing_unit") == "per_query" else 1
 
 
-def _record_freed_cost(
+def record_freed_cost(
     kwargs: MutableMapping[str, object],  # mutable-ok: writes the reduced cost where the spend row reads it
     sl_object: StandardLoggingPayload,
     original_cost: float,
@@ -95,13 +95,13 @@ async def apply_search_free_tier(
     now: datetime,
 ) -> float:
     """Zero the grounding queries that landed under the model's shared free allowance, everything else is unchanged."""
-    if kwargs.get(_COUNTED_KWARG):
+    if kwargs.get(SEARCH_FREE_TIER_COUNTED_KWARG):
         return response_cost
     allocation: Final = await allocate_search_free_tier(sl_object, response_cost, completion_response, counter, now)
     if allocation is None:
         return response_cost
-    kwargs[_COUNTED_KWARG] = True  # rebind-ok: legacy callback deduplication
-    return _record_freed_cost(kwargs, sl_object, response_cost, allocation.discount)
+    kwargs[SEARCH_FREE_TIER_COUNTED_KWARG] = True  # rebind-ok: legacy callback deduplication
+    return record_freed_cost(kwargs, sl_object, response_cost, allocation.discount)
 
 
 @with_service_target("search_free_tier")
