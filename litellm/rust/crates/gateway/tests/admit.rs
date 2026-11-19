@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use axum::{body::Body, extract::Request, http::Method};
 use litellm_config::{Config, Environment};
-use litellm_gateway_auth::keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture};
+use litellm_gateway_auth::keys::{KeyHash, KeyLimits, KeyLookup, KeyStatus, LookupFuture};
 use litellm_secret_value::SecretValue;
 use rstest::rstest;
 use serde::Deserialize;
@@ -17,30 +17,41 @@ struct Scenario {
     /// The virtual keys the database holds, each token with its model list.
     #[serde(default)]
     keys: BTreeMap<String, Vec<String>>,
+    /// The `tpm_limit` of each key that holds one.
+    #[serde(default)]
+    tpm_limits: BTreeMap<String, i64>,
     requests: Vec<Sent>,
 }
 
-/// Each key active with the model list the scenario gives it.
-struct Listed(BTreeMap<KeyHash, Arc<[String]>>);
+/// Each key active with the model list and the token limit the scenario gives it.
+struct Listed(BTreeMap<KeyHash, (Arc<[String]>, KeyLimits)>);
 
 impl KeyLookup for Listed {
     fn lookup<'a>(&'a self, hash: &'a KeyHash) -> LookupFuture<'a> {
         Box::pin(async move {
-            Ok(self.0.get(hash).map(|models| KeyStatus::Active {
+            Ok(self.0.get(hash).map(|(models, limits)| KeyStatus::Active {
                 expires_at: None,
                 models: models.clone(),
+                limits: limits.clone(),
             }))
         })
     }
 }
 
-fn listed(keys: &BTreeMap<String, Vec<String>>) -> Arc<dyn KeyLookup> {
+fn listed(
+    keys: &BTreeMap<String, Vec<String>>,
+    tpm_limits: &BTreeMap<String, i64>,
+) -> Arc<dyn KeyLookup> {
     Arc::new(Listed(
         keys.iter()
             .map(|(token, models)| {
+                let limits = KeyLimits {
+                    tpm: tpm_limits.get(token).copied(),
+                    ..KeyLimits::default()
+                };
                 (
                     KeyHash::from_token(&SecretValue::new(token)),
-                    Arc::from(models.as_slice()),
+                    (Arc::from(models.as_slice()), limits),
                 )
             })
             .collect(),
@@ -115,6 +126,7 @@ impl Sent {
 #[case::router_setting_for_every_request("router_setting_for_every_request")]
 #[case::callers("callers")]
 #[case::virtual_key_models("virtual_key_models")]
+#[case::virtual_key_token_limits("virtual_key_token_limits")]
 #[tokio::test]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -132,7 +144,7 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let state = match scenario.keys.is_empty() {
         true => state,
         false => litellm_gateway::AppState {
-            keys: Some(listed(&scenario.keys)),
+            keys: Some(listed(&scenario.keys, &scenario.tpm_limits)),
             ..state
         },
     };

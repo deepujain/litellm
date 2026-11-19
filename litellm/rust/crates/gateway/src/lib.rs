@@ -11,8 +11,13 @@ pub mod middleware;
 mod redis;
 mod resources;
 mod state;
+#[cfg(test)]
+mod test_support;
 pub use admit::{Admit, Reason, Refused};
-pub use callbacks::Callbacks;
+pub use callbacks::{
+    Callbacks, Registered,
+    parallel_request_limiter::{self, KeyLimiter},
+};
 pub use error::Error;
 pub use redis::RedisClients;
 pub use resources::Resources;
@@ -25,13 +30,14 @@ use std::{path::Path, sync::Arc};
 
 use axum::Router;
 
-use litellm_config::Config;
+use litellm_config::{Config, Environment};
 use litellm_env::{Lookup, ProcessEnvironment};
 use litellm_http::{
     ClientVariant, HttpClientPool, HttpSettings, HttpSettingsLayer, Resolution,
     media::PublicDnsResolver,
 };
 use litellm_model_catalog::{BUNDLED_REGISTRY, Catalog};
+use litellm_redis_store::Remote;
 use litellm_secrets::{OidcResolver, SecretManagerState, SecretResolver};
 
 /// The config at `path`, its `os.environ/` references read from the process environment.
@@ -55,23 +61,50 @@ pub(crate) fn environment_secrets(
     )
 }
 
+/// The inference routes of a config, and the limiter that counts their calls against each key's
+/// own limits.
+pub struct Inference {
+    pub gateway: Arc<Gateway>,
+    pub key_limiter: Arc<KeyLimiter>,
+}
+
+/// The inference routes of `config` with the callbacks the gateway runs around their calls. The
+/// deployments' usage and the keys' limits are counted in `redis`'s coordination client when
+/// there is one, and in this process's memory otherwise.
 pub async fn build_inference(
     config: &Config,
+    environment: &Environment,
     resources: &Resources,
-) -> Result<Arc<Gateway>, Error> {
+    redis: &RedisClients,
+) -> Result<Inference, Error> {
     let catalog = Catalog::parse(BUNDLED_REGISTRY)?.value;
     let (router, shaping) = boot::router(config, &catalog).await?;
-    Ok(Arc::new(
-        Gateway::new(
-            resources.core.clone(),
-            resources.http.clone(),
-            resources.secrets.clone(),
-            router,
-            shaping,
-            host::NativeHost::default(),
-        )?
-        .with_client_side_credentials(config.general_settings.allow_client_side_credentials),
-    ))
+    let key_limiter = KeyLimiter::new(
+        parallel_request_limiter::Settings::read(config, environment),
+        redis.coordination.clone(),
+        router.clone(),
+    );
+    let callbacks = Callbacks::new(vec![key_limiter.registered()])?;
+    let gateway = Gateway::new(
+        resources.core.clone(),
+        resources.http.clone(),
+        resources.secrets.clone(),
+        router,
+        shaping,
+        host::NativeHost::new(Arc::new(callbacks)),
+    )?
+    .with_client_side_credentials(config.general_settings.allow_client_side_credentials);
+    let usage_redis = redis.coordination.clone().map(|client| Remote {
+        client,
+        default_ttl: parallel_request_limiter::REDIS_DEFAULT_TTL,
+    });
+    Ok(Inference {
+        gateway: Arc::new(match usage_redis {
+            Some(remote) => gateway.with_usage_redis(remote),
+            None => gateway,
+        }),
+        key_limiter,
+    })
 }
 
 pub fn install_crypto_provider() {
@@ -81,11 +114,13 @@ pub fn install_crypto_provider() {
 }
 
 pub fn router(state: AppState, config: &Config) -> Router {
-    let inference = litellm_gateway_inference::router(state.inference.clone()).route_layer(
-        axum::middleware::from_fn_with_state(
-            state.auth(config),
-            litellm_gateway_auth::authenticate,
-        ),
-    );
+    let inference = middleware::rate_limited(
+        litellm_gateway_inference::router(state.inference.clone()),
+        state.key_limiter.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
+        state.auth(config),
+        litellm_gateway_auth::authenticate,
+    ));
     middleware::inference(inference).merge(health::router(state))
 }

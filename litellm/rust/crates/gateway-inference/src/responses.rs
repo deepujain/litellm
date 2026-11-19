@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// Python's `call_type` for this route.
-const CALL_TYPE: &str = "aresponses";
+pub(crate) const CALL_TYPE: &str = "aresponses";
 
 pub(crate) async fn create<H: Host>(
     State(gateway): State<Arc<Gateway<H>>>,

@@ -46,7 +46,7 @@ const ANTHROPIC_API_HEADER_PROVIDERS: &str =
 const TOOLS: &str = "tools";
 const PATH: &str = "/v1/messages";
 /// Python's `call_type` for this route.
-const CALL_TYPE: &str = "anthropic_messages";
+pub(crate) const CALL_TYPE: &str = "anthropic_messages";
 
 pub async fn create<H: Host>(
     State(gateway): State<Arc<Gateway<H>>>,

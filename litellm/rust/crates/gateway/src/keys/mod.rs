@@ -1,20 +1,23 @@
 //! The virtual keys the native app authenticates, read from Python's Redis auth cache when it
 //! shares one, and otherwise from the proxy's database on every request.
 //!
-//! The native app honors a key's expiry, its block and its model list and nothing else a key can
-//! carry, so it only authenticates a key that carries nothing else. Each column of the key's row is taken apart
+//! The native app honors a key's expiry, its block, its model list, its `rpm_limit`, `tpm_limit`
+//! and `max_parallel_requests`, the per-model limits in its metadata, and nothing else a key can
+//! carry, so it only authenticates a key that carries nothing else. Its `tpd_limit` only counts a
+//! batch, which no native route serves. Each column of the key's row is taken apart
 //! by name, so a column added to the row does not compile here until it is honored or named.
 
-use std::{sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use chrono::NaiveDateTime;
 use litellm_error::Source;
 use litellm_gateway_auth::{
     Error,
-    keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture},
+    keys::{KeyHash, KeyLimits, KeyLookup, KeyStatus, LookupFuture, ModelLimits},
 };
 use litellm_redis_store::auth_cache::AuthCache;
 use litellm_repositories::{KeyRepository, KeyView, RawJson, Side};
+use serde::Deserialize;
 
 /// The name of the first of `fields` that holds something.
 macro_rules! carried {
@@ -128,6 +131,11 @@ fn carried(key: &KeyView) -> Option<&'static str> {
         organization_rpm_limit: _,
         organization_metadata: _,
         project_alias: _,
+        max_parallel_requests: _,
+        rpm_limit: _,
+        tpm_limit: _,
+        tpd_limit: _,
+        metadata: _,
         key_type,
         soft_budget_cooldown,
         models,
@@ -140,11 +148,6 @@ fn carried(key: &KeyView) -> Option<&'static str> {
         project_id,
         org_id,
         permissions,
-        max_parallel_requests,
-        metadata,
-        tpm_limit,
-        rpm_limit,
-        tpd_limit,
         max_budget,
         soft_budget,
         budget_duration,
@@ -177,11 +180,6 @@ fn carried(key: &KeyView) -> Option<&'static str> {
                 project_id,
                 org_id,
                 permissions,
-                max_parallel_requests,
-                metadata,
-                tpm_limit,
-                rpm_limit,
-                tpd_limit,
                 max_budget,
                 soft_budget,
                 budget_duration,
@@ -198,19 +196,53 @@ fn carried(key: &KeyView) -> Option<&'static str> {
         })
 }
 
+/// The `metadata` the native app honors: the key's own limit for each model it names one for,
+/// which `/key/generate` stores from `model_rpm_limit` and `model_tpm_limit`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Metadata {
+    #[serde(default)]
+    model_rpm_limit: BTreeMap<String, i64>,
+    #[serde(default)]
+    model_tpm_limit: BTreeMap<String, i64>,
+}
+
+impl Metadata {
+    /// `None` when `metadata` holds anything else, or a limit that is not a whole number.
+    fn read(metadata: &RawJson) -> Option<Self> {
+        if !metadata.is_carried() {
+            return Some(Self::default());
+        }
+        serde_json::from_str(metadata.get()).ok()
+    }
+}
+
 /// `Err` names the column, or the cached auth field in `also`, that holds something the native
 /// app does not honor.
 fn status(key: &KeyView, also: Option<&'static str>) -> Result<KeyStatus, &'static str> {
     if key.blocked == Some(true) {
         return Ok(KeyStatus::Revoked);
     }
-    match carried(key).or(also) {
-        Some(column) => Err(column),
-        None => Ok(KeyStatus::Active {
-            expires_at: key.expires.map(|at| SystemTime::from(at.and_utc())),
-            models: Arc::from(key.models.as_slice()),
-        }),
+    if let Some(column) = carried(key) {
+        return Err(column);
     }
+    let Some(metadata) = Metadata::read(&key.metadata) else {
+        return Err("metadata");
+    };
+    if let Some(field) = also {
+        return Err(field);
+    }
+    Ok(KeyStatus::Active {
+        expires_at: key.expires.map(|at| SystemTime::from(at.and_utc())),
+        models: Arc::from(key.models.as_slice()),
+        limits: KeyLimits {
+            rpm: key.rpm_limit,
+            tpm: key.tpm_limit,
+            max_parallel_requests: key.max_parallel_requests.map(i64::from),
+            model_rpm: ModelLimits::new(metadata.model_rpm_limit),
+            model_tpm: ModelLimits::new(metadata.model_tpm_limit),
+        },
+    })
 }
 
 /// The proxy's keys: what Python cached in the Redis `cache` it shares, else the database row.
@@ -392,8 +424,76 @@ mod tests {
                 expires_at: expires_at
                     .map(|second| SystemTime::UNIX_EPOCH + Duration::from_secs(second)),
                 models: models.iter().map(|model| (*model).to_owned()).collect(),
+                limits: KeyLimits::default(),
             })
         );
+    }
+
+    fn limits(key: &KeyView) -> Result<KeyLimits, &'static str> {
+        match status(key, None)? {
+            KeyStatus::Active { limits, .. } => Ok(limits),
+            KeyStatus::Revoked => Err("revoked"),
+        }
+    }
+
+    #[rstest]
+    #[case::rpm(Some(2), None, None)]
+    #[case::tpm(None, Some(100), None)]
+    #[case::parallel(None, None, Some(1))]
+    #[case::all_and_zero(Some(0), Some(0), Some(0))]
+    fn a_keys_rpm_tpm_and_parallel_limits_are_its_limits(
+        #[case] rpm: Option<i64>,
+        #[case] tpm: Option<i64>,
+        #[case] max_parallel_requests: Option<i32>,
+    ) {
+        let key = KeyView {
+            rpm_limit: rpm,
+            tpm_limit: tpm,
+            max_parallel_requests,
+            ..plain()
+        };
+
+        assert_eq!(
+            limits(&key),
+            Ok(KeyLimits {
+                rpm,
+                tpm,
+                max_parallel_requests: max_parallel_requests.map(i64::from),
+                ..KeyLimits::default()
+            })
+        );
+    }
+
+    #[rstest]
+    fn a_keys_metadata_model_limits_are_its_limits_by_model() {
+        let key = KeyView {
+            metadata: json(
+                r#"{"model_rpm_limit":{"claude":2},"model_tpm_limit":{"claude":100,"gpt":0}}"#,
+            ),
+            ..plain()
+        };
+
+        assert_eq!(
+            limits(&key),
+            Ok(KeyLimits {
+                model_rpm: ModelLimits::new(BTreeMap::from([("claude".to_owned(), 2)])),
+                model_tpm: ModelLimits::new(BTreeMap::from([
+                    ("claude".to_owned(), 100),
+                    ("gpt".to_owned(), 0),
+                ])),
+                ..KeyLimits::default()
+            })
+        );
+    }
+
+    #[rstest]
+    fn a_daily_token_limit_only_counts_batches_so_the_key_stays_active() {
+        let key = KeyView {
+            tpd_limit: Some(1),
+            ..plain()
+        };
+
+        assert_eq!(limits(&key), Ok(KeyLimits::default()));
     }
 
     #[rstest]
@@ -423,12 +523,10 @@ mod tests {
     #[case::project_id(|key: &mut KeyView| key.project_id = Some("project".to_owned()), "project_id")]
     #[case::org_id(|key: &mut KeyView| key.org_id = Some("org".to_owned()), "org_id")]
     #[case::permissions(|key: &mut KeyView| key.permissions = json(r#"{"a":true}"#), "permissions")]
-    #[case::max_parallel_requests(|key: &mut KeyView| key.max_parallel_requests = Some(1), "max_parallel_requests")]
     #[case::metadata(|key: &mut KeyView| key.metadata = json(r#"{"guardrails":["pii"]}"#), "metadata")]
-    #[case::tpm_limit(|key: &mut KeyView| key.tpm_limit = Some(1), "tpm_limit")]
-    #[case::rpm_limit(|key: &mut KeyView| key.rpm_limit = Some(1), "rpm_limit")]
-    #[case::a_limit_of_zero(|key: &mut KeyView| key.rpm_limit = Some(0), "rpm_limit")]
-    #[case::tpd_limit(|key: &mut KeyView| key.tpd_limit = Some(1), "tpd_limit")]
+    #[case::metadata_beside_a_model_limit(|key: &mut KeyView| key.metadata = json(r#"{"model_rpm_limit":{"claude":2},"tags":["a"]}"#), "metadata")]
+    #[case::a_model_limit_that_is_no_whole_number(|key: &mut KeyView| key.metadata = json(r#"{"model_tpm_limit":{"claude":"100"}}"#), "metadata")]
+    #[case::model_limits_that_are_no_map(|key: &mut KeyView| key.metadata = json(r#"{"model_rpm_limit":5}"#), "metadata")]
     #[case::max_budget(|key: &mut KeyView| key.max_budget = Some(5.0), "max_budget")]
     #[case::soft_budget(|key: &mut KeyView| key.soft_budget = Some(5.0), "soft_budget")]
     #[case::budget_duration(|key: &mut KeyView| key.budget_duration = Some("30d".to_owned()), "budget_duration")]

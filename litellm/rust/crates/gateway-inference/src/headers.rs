@@ -63,6 +63,11 @@ impl Routing {
         }
     }
 
+    /// The model group that served the call, `None` for a call that ended on a failed attempt.
+    pub(crate) fn model_group(&self) -> Option<&str> {
+        Some(&self.served.as_ref()?.model_group)
+    }
+
     /// For a call that ended on a failed attempt on `deployment_id`.
     pub(crate) fn failed_on(deployment_id: &str) -> Self {
         Self {

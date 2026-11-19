@@ -32,7 +32,7 @@ pub(crate) async fn create<H: Host>(
 }
 
 /// Python's `call_type` for this route.
-const CALL_TYPE: &str = "atranscription";
+pub(crate) const CALL_TYPE: &str = "atranscription";
 
 async fn serve<H: Host>(
     gateway: &Gateway<H>,

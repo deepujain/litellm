@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,7 +10,7 @@ use std::{
 use litellm_gateway_auth::{
     AccessRequest, Auth, AuthenticationMethod, Clock, Error, KeyAuthenticator, KeyHolder,
     NoAdditionalPolicy,
-    keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture},
+    keys::{KeyHash, KeyLimits, KeyLookup, KeyStatus, LookupFuture},
 };
 use litellm_secret_value::SecretValue;
 use rstest::rstest;
@@ -78,6 +79,7 @@ fn expiring(at: Option<u64>) -> Option<KeyStatus> {
     Some(KeyStatus::Active {
         expires_at: at.map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
         models: Arc::from([]),
+        limits: KeyLimits::default(),
     })
 }
 
@@ -120,6 +122,37 @@ async fn an_active_virtual_key_reaches_every_route_and_model(#[case] expires_at:
     ] {
         assert!(identity.authorize(request).await.is_ok());
     }
+}
+
+#[tokio::test]
+async fn an_active_virtual_keys_limits_reach_its_caller_and_the_master_key_has_none() {
+    let limits = KeyLimits {
+        rpm: Some(2),
+        tpm: Some(100),
+        max_parallel_requests: Some(1),
+        model_rpm: Arc::new(BTreeMap::from([("claude".to_owned(), 1)])),
+        model_tpm: Arc::new(BTreeMap::from([("claude".to_owned(), 50)])),
+    };
+    let auth = auth(holding(Some(KeyStatus::Active {
+        expires_at: None,
+        models: Arc::from([]),
+        limits: limits.clone(),
+    })));
+
+    let key = auth
+        .authenticate(&SecretValue::new(VIRTUAL_KEY))
+        .await
+        .unwrap();
+    let master = auth
+        .authenticate(&SecretValue::new(MASTER_KEY))
+        .await
+        .unwrap();
+
+    assert_eq!(key.caller().authentication().limits, limits);
+    assert_eq!(
+        master.caller().authentication().limits,
+        KeyLimits::default()
+    );
 }
 
 #[rstest]
@@ -204,6 +237,7 @@ async fn a_key_with_a_model_list_may_call_only_what_the_proxy_lets_it(
     let keys = holding(Some(KeyStatus::Active {
         expires_at: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
+        limits: KeyLimits::default(),
     }));
     let identity = auth(keys)
         .authenticate(&SecretValue::new(VIRTUAL_KEY))

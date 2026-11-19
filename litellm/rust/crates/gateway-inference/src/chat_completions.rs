@@ -50,7 +50,7 @@ pub(crate) async fn create_from_model_path<H: Host>(
 }
 
 /// Python's `call_type` for this route.
-const CALL_TYPE: &str = "acompletion";
+pub(crate) const CALL_TYPE: &str = "acompletion";
 
 async fn handle<H: Host>(
     gateway: &Gateway<H>,
