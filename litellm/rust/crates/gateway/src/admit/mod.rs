@@ -13,15 +13,15 @@ use std::sync::Arc;
 use axum::{body::Body, extract::Request, http::request::Parts};
 use litellm_config::{Config, Environment};
 use litellm_core_utils::get_llm_provider_logic::LlmProviders;
-use litellm_env::Lookup;
-use litellm_gateway_auth::{Auth, BearerOrXApiKey};
-use litellm_gateway_inference::JsonObject;
+use litellm_gateway_auth::{Auth, BearerOrXApiKey, Permissions, Preauthenticated};
+use litellm_gateway_inference::{JsonObject, routing};
 use litellm_model_catalog::CostMap;
 use litellm_router_core::registry::DeploymentFilter;
 use serde_json::{Map, Value};
 
-use crate::AppState;
+use crate::{AppState, Gateway};
 pub use checks::Reason;
+use checks::{Authenticated, Fields};
 use groups::Groups;
 
 /// Why the gateway does not serve a request the way the Python proxy would.
@@ -63,9 +63,6 @@ pub struct Admit {
     config: Config,
     /// The variables only the environment holds, as `main` read them.
     environment: Environment,
-    /// What gives the proxy a database, which it writes a spend log and key spend to after every
-    /// call, the master key's included.
-    database: Option<Box<str>>,
     /// The variable that has the proxy serve models and settings from its database on top of the
     /// config. `general_settings.store_model_in_db` is a setting of the config itself.
     stored_models: Option<Box<str>>,
@@ -78,31 +75,12 @@ pub struct Admit {
     /// `None` when a fallback list or an alias is written in a shape that is not read.
     groups: Option<Groups>,
     auth: Auth,
+    /// The native app's inference, which tells whether a caller may call the model it asks for.
+    /// `None` leaves every caller with a model list to Python.
+    inference: Option<Arc<Gateway>>,
 }
-
-/// The variables the proxy builds a database from when `database_url` names none.
-const DATABASE_VARIABLES: [&str; 4] = [
-    "DATABASE_URL",
-    "DATABASE_HOST",
-    "IAM_TOKEN_DB_AUTH",
-    "AZURE_POSTGRESQL_AUTH",
-];
 
 const STORE_MODEL_IN_DB: &str = "STORE_MODEL_IN_DB";
-
-fn database(config: &Config, environment: &dyn Lookup) -> Option<Box<str>> {
-    config
-        .general_settings
-        .database_url
-        .as_ref()
-        .map(|_| "general_settings.database_url".into())
-        .or_else(|| {
-            DATABASE_VARIABLES
-                .into_iter()
-                .find(|variable| environment.get(variable).is_some())
-                .map(Box::from)
-        })
-}
 
 fn refused(request: Parts, body: Body, reason: Reason) -> (Box<Request>, Reason) {
     tracing::debug!(why = %reason.why, over = %reason.over, "python answers a request over this");
@@ -144,13 +122,13 @@ impl Admit {
             .collect();
         Self {
             environment: environment.clone(),
-            database: database(config, &*state.environment),
             stored_models: state
                 .environment
                 .get(STORE_MODEL_IN_DB)
                 .map(|_| STORE_MODEL_IN_DB.into()),
             auth: state.auth(config),
             aliased,
+            inference: Some(state.inference.clone()),
             ..Self::over(config, deployed)
         }
     }
@@ -177,11 +155,26 @@ impl Admit {
             auth: Auth::from_config(config).with_extractor(Arc::new(BearerOrXApiKey)),
             config: config.clone(),
             environment: Environment::default(),
-            database: None,
             stored_models: None,
             deployed,
             aliased: Vec::new(),
+            inference: None,
         }
+    }
+
+    /// A caller whose model list does not let it call the model it asks for goes to Python, which
+    /// answers the refusal itself. The native route asks the same question of the same router.
+    async fn model_access(&self, authenticated: &Authenticated, fields: &Fields) -> Option<Reason> {
+        let identity = authenticated.as_ref().ok()?;
+        let Permissions::Models(_) = identity.caller().restrictions() else {
+            return None;
+        };
+        let model = fields.get("model")?.as_str()?;
+        let allowed = match &self.inference {
+            Some(inference) => routing::allows(inference, identity, model).await,
+            None => false,
+        };
+        (!allowed).then(|| Reason::new(Refused::Credential, "models"))
     }
 
     /// The body is read only for a request that passes every other check, and parsed once: an
@@ -215,7 +208,13 @@ impl Admit {
         if let Some(reason) = checks::BODY.iter().find_map(|check| check(&self, &fields)) {
             return Err(refused(parts, body, reason));
         }
+        if let Some(reason) = self.model_access(&authenticated, &fields).await {
+            return Err(refused(parts, body, reason));
+        }
         parts.extensions.insert(JsonObject(fields));
+        if let Ok(identity) = authenticated {
+            parts.extensions.insert(Preauthenticated(identity));
+        }
         Ok(Request::from_parts(parts, body))
     }
 }
@@ -223,6 +222,8 @@ impl Admit {
 #[cfg(test)]
 mod tests {
     use axum::http::Method;
+    use litellm_gateway_auth::keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture};
+    use litellm_secret_value::SecretValue;
     use rstest::rstest;
 
     use super::*;
@@ -237,6 +238,84 @@ mod tests {
             ("gpt".to_owned(), Ok(LlmProviders::Openai)),
         ];
         Arc::new(Admit::over(&config, deployed))
+    }
+
+    const VIRTUAL_KEY: (&str, &str) = ("authorization", "Bearer sk-virtual");
+
+    /// What the database answers for the hash of [`VIRTUAL_KEY`], and nothing for any other.
+    #[derive(Clone, Copy)]
+    enum Held {
+        Active,
+        Revoked,
+        Restricted,
+        Unreachable,
+    }
+
+    impl KeyLookup for Held {
+        fn lookup<'a>(&'a self, hash: &'a KeyHash) -> LookupFuture<'a> {
+            Box::pin(async move {
+                if hash != &KeyHash::from_token(&SecretValue::new("sk-virtual")) {
+                    return Ok(None);
+                }
+                match self {
+                    Self::Active => Ok(Some(KeyStatus::Active {
+                        expires_at: None,
+                        models: Arc::from([]),
+                    })),
+                    Self::Revoked => Ok(Some(KeyStatus::Revoked)),
+                    Self::Restricted => Err(litellm_gateway_auth::Error::Forbidden),
+                    Self::Unreachable => Err(litellm_gateway_auth::Error::Unavailable(
+                        litellm_error::Source::new(std::io::Error::other("database down")),
+                    )),
+                }
+            })
+        }
+    }
+
+    fn holding(held: Held) -> Arc<Admit> {
+        let config = Config::from_yaml(CONFIG).unwrap();
+        Arc::new(Admit {
+            auth: Auth::with_keys(&config, Arc::new(held))
+                .with_extractor(Arc::new(BearerOrXApiKey)),
+            ..Admit::over(
+                &config,
+                vec![("claude".to_owned(), Ok(LlmProviders::Anthropic))],
+            )
+        })
+    }
+
+    async fn refusal(admit: Arc<Admit>, request: Request) -> Option<Refused> {
+        admit
+            .admit(request)
+            .await
+            .err()
+            .map(|(_, reason)| reason.why)
+    }
+
+    #[rstest]
+    #[case::active(Held::Active, VIRTUAL_KEY, None)]
+    #[case::revoked(Held::Revoked, VIRTUAL_KEY, Some(Refused::Credential))]
+    #[case::holding_what_the_native_app_does_not_honor(
+        Held::Restricted,
+        VIRTUAL_KEY,
+        Some(Refused::Credential)
+    )]
+    #[case::unreadable(Held::Unreachable, VIRTUAL_KEY, Some(Refused::Credential))]
+    #[case::unknown(
+        Held::Active,
+        ("authorization", "Bearer sk-someone-else"),
+        Some(Refused::Credential)
+    )]
+    #[tokio::test]
+    async fn a_virtual_key_is_admitted_only_when_the_native_app_authenticates_it(
+        #[case] held: Held,
+        #[case] credential: (&str, &str),
+        #[case] why: Option<Refused>,
+    ) {
+        assert_eq!(
+            refusal(holding(held), messages(&[credential], "claude")).await,
+            why
+        );
     }
 
     fn messages(headers: &[(&str, &str)], model: &str) -> Request {

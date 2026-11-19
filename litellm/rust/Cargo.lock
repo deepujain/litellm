@@ -4024,6 +4024,7 @@ name = "litellm-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "envy",
  "flate2",
  "futures-util",
@@ -4052,8 +4053,10 @@ dependencies = [
  "litellm-redis-client",
  "litellm-redis-connect",
  "litellm-redis-resolve",
+ "litellm-redis-store",
  "litellm-redis-testing",
  "litellm-redis-types",
+ "litellm-repositories",
  "litellm-router-core",
  "litellm-secret-value",
  "litellm-secrets",

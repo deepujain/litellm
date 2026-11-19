@@ -6,13 +6,45 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use axum::{body::Body, extract::Request, http::Method};
 use litellm_config::{Config, Environment};
+use litellm_gateway_auth::keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture};
+use litellm_secret_value::SecretValue;
 use rstest::rstest;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Scenario {
     config: serde_yaml_ng::Value,
+    /// The virtual keys the database holds, each token with its model list.
+    #[serde(default)]
+    keys: BTreeMap<String, Vec<String>>,
     requests: Vec<Sent>,
+}
+
+/// Each key active with the model list the scenario gives it.
+struct Listed(BTreeMap<KeyHash, Arc<[String]>>);
+
+impl KeyLookup for Listed {
+    fn lookup<'a>(&'a self, hash: &'a KeyHash) -> LookupFuture<'a> {
+        Box::pin(async move {
+            Ok(self.0.get(hash).map(|models| KeyStatus::Active {
+                expires_at: None,
+                models: models.clone(),
+            }))
+        })
+    }
+}
+
+fn listed(keys: &BTreeMap<String, Vec<String>>) -> Arc<dyn KeyLookup> {
+    Arc::new(Listed(
+        keys.iter()
+            .map(|(token, models)| {
+                (
+                    KeyHash::from_token(&SecretValue::new(token)),
+                    Arc::from(models.as_slice()),
+                )
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -82,6 +114,7 @@ impl Sent {
 #[case::model_aliases("model_aliases")]
 #[case::router_setting_for_every_request("router_setting_for_every_request")]
 #[case::callers("callers")]
+#[case::virtual_key_models("virtual_key_models")]
 #[tokio::test]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -96,6 +129,13 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let state = litellm_gateway::AppState::over(&built, &Environment::default(), &resources)
         .await
         .unwrap();
+    let state = match scenario.keys.is_empty() {
+        true => state,
+        false => litellm_gateway::AppState {
+            keys: Some(listed(&scenario.keys)),
+            ..state
+        },
+    };
     let admit = Arc::new(litellm_gateway::Admit::new(
         &config,
         &Environment::default(),

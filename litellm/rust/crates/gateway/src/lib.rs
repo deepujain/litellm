@@ -5,6 +5,7 @@ mod db;
 mod error;
 mod health;
 pub mod host;
+mod keys;
 mod license;
 pub mod middleware;
 mod redis;
