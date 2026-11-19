@@ -2001,6 +2001,16 @@ class RustTagRepository:
     def find_many_with_budgets(self, names: Sequence[str]) -> Future[list[str]]: ...
 
 @final
+class RustAuditLogRepository:
+    def __new__(cls, database: NativeDatabase) -> RustAuditLogRepository: ...
+    def insert(
+        self, row: tuple[str, int, str | None, str | None, str, str, str, str | None, str | None]
+    ) -> Future[None]: ...
+    def insert_many(
+        self, rows: Sequence[tuple[str, int, str | None, str | None, str, str, str, str | None, str | None]]
+    ) -> Future[None]: ...
+
+@final
 class RustAgentIdentityRepository:
     def __new__(cls, database: NativeDatabase) -> RustAgentIdentityRepository: ...
     def record_authentication(self, agent_id: str, revision: str) -> Future[bool]: ...
@@ -2307,6 +2317,7 @@ __all__ = [
     "RouterCoreHandle",
     "RustAccessGroupRepository",
     "RustAgentIdentityRepository",
+    "RustAuditLogRepository",
     "RustAuth",
     "RustAuthOutcome",
     "RustAuthSettings",
