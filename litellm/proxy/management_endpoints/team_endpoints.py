@@ -117,7 +117,6 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     get_team_object,
     get_user_object,
     invalidate_team_member_spend_state,
-    jwt_key_mapping_cache_key,
     resolve_effective_team_member_budget,
     team_max_budget_alert_emails_error,
 )
@@ -138,11 +137,7 @@ from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.openai_error_payload import proxy_exception_for
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time, keeps_due_budget_reset
-from litellm.proxy.common_utils.user_api_key_cache import (
-    UserApiKeyCache,
-    team_membership_auth_cache_key,
-    team_membership_reservation_cache_key,
-)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.db_span import db_span
 from litellm.proxy.guardrails.guardrail_helpers import validate_guardrail_names
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
@@ -240,6 +235,7 @@ from litellm.proxy.utils import (
     handle_exception_on_proxy,
     query_raw_within_statement_timeout,
 )
+from litellm.redis.stores.auth_cache import AuthObject
 from litellm.redis.stores.spend_counters import team_counter, team_window_counter
 from litellm.repositories.access_group_repository import AccessGroupRepository
 from litellm.repositories.budget_repository import BudgetRepository
@@ -5136,7 +5132,7 @@ async def _delete_roster_member_keys_tx(
     )
     await delete_many_in(team_tx.litellm_verificationtoken, "token", tokens, atomicity="caller_transaction")
     return member_keys, tuple(
-        jwt_key_mapping_cache_key(mapping.jwt_claim_name, mapping.jwt_claim_value, mapping.jwt_issuer)
+        AuthObject.jwt_key_mapping(mapping.jwt_claim_name, mapping.jwt_claim_value, mapping.jwt_issuer).key
         for mapping in jwt_mappings
     )
 
@@ -5288,8 +5284,8 @@ async def _evict_deleted_team_member_cache(
 def member_cache_keys(team_id: str, user_ids: Sequence[str]) -> Iterator[str]:
     for user_id in user_ids:
         yield user_id
-        yield team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
-        yield team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
+        yield AuthObject.team_membership(team_id=team_id, user_id=user_id).key
+        yield AuthObject.team_membership_reservation(user_id=user_id, team_id=team_id).key
 
 
 async def _resolve_deleted_team_member_user_ids(

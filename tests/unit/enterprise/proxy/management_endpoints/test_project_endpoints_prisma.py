@@ -32,8 +32,7 @@ from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.utils import ProxyLogging
 
 
-
-from litellm.caching.caching import DualCache
+from litellm.redis.stores.auth_cache import AuthObject
 from litellm.proxy._types import (
     LiteLLM_ProjectTable,
     NewProjectRequest,
@@ -51,7 +50,7 @@ from litellm.proxy.management.users.service import PrismaOrgRoles
 from tests._master_key import MASTER_KEY
 from tests.unit.proxy.rust_auth_stores import install_rust_auth_stores
 
-proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+proxy_logging_obj = ProxyLogging(user_api_key_cache=UserApiKeyCache())
 
 
 ### VALIDATION TESTS ###
@@ -669,7 +668,7 @@ async def test_project_eviction_publishes_cross_worker_invalidation(monkeypatch)
             project_id=project_id, user_api_key_cache=UserApiKeyCache()
         )
 
-    mock_publish.assert_awaited_once_with(cache_key=f"project_id:{project_id}")
+    mock_publish.assert_awaited_once_with(cache_key=AuthObject.project(project_id).key)
 
 
 def test_enforce_project_model_quota_missing_both_raises():
@@ -1886,7 +1885,7 @@ def project_access_db(monkeypatch):
 async def _team_access_over_cached_users() -> TeamAccess:
     cache = UserApiKeyCache()
     for user in _USERS.values():
-        await cache.async_set_cache(key=user.user_id, value=user)
+        await cache.async_set_cache(key=AuthObject.user(user.user_id), value=user)
     return TeamAccess(org_roles=PrismaOrgRoles(None, cache, proxy_logging_obj))
 
 

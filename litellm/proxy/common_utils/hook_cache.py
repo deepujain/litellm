@@ -29,7 +29,7 @@ class HookCache(DualCache):
     def get_cache(
         self, key: str, parent_otel_span: Span | None = None, local_only: bool = False, **kwargs: object
     ) -> object:
-        held: Final[object] = self._auth_cache().get_cache(key=key, local_only=True)
+        held: Final[object] = self._auth_cache().get_local_by_key(key)
         if held is not None:
             return held
         return super().get_cache(key, parent_otel_span=parent_otel_span, local_only=local_only, **kwargs)
@@ -37,7 +37,7 @@ class HookCache(DualCache):
     async def async_get_cache(
         self, key: str, parent_otel_span: Span | None = None, local_only: bool = False, **kwargs: object
     ) -> object:
-        held: Final[object] = self._auth_cache().get_cache(key=key, local_only=True)
+        held: Final[object] = self._auth_cache().get_local_by_key(key)
         if held is not None:
             return held
         return await super().async_get_cache(key, parent_otel_span=parent_otel_span, local_only=local_only, **kwargs)

@@ -31,6 +31,7 @@ from litellm.proxy.management_helpers.customer_hierarchy import (
     related_budget,
     utc_datetime,
 )
+from litellm.redis.stores.auth_cache import AuthObject
 from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.repositories.table_repositories import PrismaTableRepository
@@ -87,7 +88,7 @@ class _ResourceRecord(BaseModel):
 
 
 _DEFINITION_PARAM: Final = "customer_app_definition"
-_DEFINITION_CACHE_KEY: Final = "customer_app_definition:global"
+_DEFINITION: Final = AuthObject.customer_app_definition()
 _PARENT_ORG_ID: Final = TypeAdapter(str)
 AppEntity: Final = TypeVar("AppEntity", App, AppOrganization, AppMember)
 AppAssociation: Final = TypeVar("AppAssociation", AppOrganization, AppMember)
@@ -244,10 +245,10 @@ class AppStore:
     @with_service_target(AUTH_OBJECTS_TARGET)
     async def definition(self) -> AppDefinition:
         if self.cache is not None:
-            cached: Final = await self.cache.async_get_cache(key=_DEFINITION_CACHE_KEY, model_type=AppDefinition)
+            cached: Final = await self.cache.async_get_cache(key=_DEFINITION, model_type=AppDefinition)
             if cached is not None:
                 return cached
-            lease: Final = await self.cache.lease(_DEFINITION_CACHE_KEY)
+            lease: Final = await self.cache.lease(_DEFINITION)
             definition: Final = await self._read_definition()
             _ = await self.cache.async_set_leased(lease, definition, get_management_object_ttl(self.cache))
             return definition
@@ -267,7 +268,7 @@ class AppStore:
             return
         self._definition_cache_dirty = False
         if self.cache is not None:
-            await evict_and_broadcast((_DEFINITION_CACHE_KEY,), self.cache)
+            await evict_and_broadcast((_DEFINITION.key,), self.cache)
 
     async def lock_definition(self) -> _DefinitionState:
         from prisma import Json
