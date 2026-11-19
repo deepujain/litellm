@@ -2,13 +2,14 @@ use std::{
     convert::Infallible,
     error::Error,
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{ServiceExt, extract::Request, response::Response};
 use litellm_config::{Config, Environment};
 use litellm_env::Lookup;
-use litellm_gateway::{Admit, AppState};
+use litellm_gateway::{Admit, AppState, Refused, Resources};
 use litellm_tracing::{Level, Logger, Metadata, Record, Sink};
 use serde_json::json;
 use tower::{Layer, Service};
@@ -101,6 +102,20 @@ async fn pythons_config(path: Option<&Path>) -> Option<Config> {
     }
 }
 
+/// Python answers every request when the gateway is not running the config Python runs with.
+async fn admitted(
+    admit: Option<Arc<Admit>>,
+    request: Request,
+) -> Result<Request, (Box<Request>, Refused)> {
+    match admit {
+        Some(admit) => admit
+            .admit(request)
+            .await
+            .map_err(|(request, reason)| (request, reason.why)),
+        None => Err((Box::new(request), Refused::Configuration)),
+    }
+}
+
 /// The native app's state for the config Python runs with, and which requests it answers. When
 /// that config cannot be loaded, or the native app cannot be built from it, the state is built
 /// from an empty config and Python answers every request, because failing here would stop Python
@@ -108,13 +123,10 @@ async fn pythons_config(path: Option<&Path>) -> Option<Config> {
 async fn native_state(
     loaded: Option<Config>,
     environment: &Environment,
-) -> Result<(Config, AppState, Admit), litellm_gateway::Error> {
+) -> Result<(Config, AppState, Option<Arc<Admit>>), litellm_gateway::Error> {
     if let Some(config) = loaded {
-        match AppState::build(&config, environment).await {
-            Ok(state) => {
-                let admit = Admit::new(&config);
-                return Ok((config, state, admit));
-            }
+        match admitted_state(&config, environment).await {
+            Ok((state, admit)) => return Ok((config, state, Some(Arc::new(admit)))),
             Err(error) => tracing::error!(
                 error = %litellm_error::Report::new(&error),
                 "could not build the native app from the config python runs with, so python answers every request"
@@ -123,7 +135,18 @@ async fn native_state(
     }
     let config = Config::default();
     let state = AppState::build(&config, environment).await?;
-    Ok((config, state, Admit::unconfigured()))
+    Ok((config, state, None))
+}
+
+async fn admitted_state(
+    config: &Config,
+    environment: &Environment,
+) -> Result<(AppState, Admit), litellm_gateway::Error> {
+    let native = Admit::native_config(config);
+    let resources = Resources::build(&native)?;
+    let state = AppState::over(&native, environment, &resources).await?;
+    let admit = Admit::new(config, environment, &state);
+    Ok((state, admit))
 }
 
 /// Serves natively the requests the gateway admits, in front of the Python proxy, which answers
@@ -138,7 +161,7 @@ async fn in_front_of_python(
     let ran = litellm_gateway_forward::run(
         forward,
         native(state.clone(), &config, environment),
-        move |request| admit.clone().admit(request),
+        move |request| admitted(admit.clone(), request),
         async move {
             tokio::select! { () = shutdown_signal() => (), () = stdin_closed => () }
         },
@@ -267,28 +290,42 @@ mod tests {
     }
 
     /// Why a master key caller's `/v1/messages` request is left to Python.
-    async fn refused(admit: Admit) -> Option<&'static str> {
+    async fn refused(admit: Option<Arc<Admit>>) -> Option<&'static str> {
         let request = Request::post("/v1/messages")
             .header("authorization", "Bearer gateway-key")
             .body(axum::body::Body::empty())
             .unwrap();
-        admit.admit(request).await.err().map(|(_, why)| why.into())
+        admitted(admit, request)
+            .await
+            .err()
+            .map(|(_, why)| why.into())
     }
 
     #[rstest]
+    #[case::a_setting_the_native_app_does_not_honor(
+        "litellm_settings:\n  cache: true\n",
+        "settings"
+    )]
+    #[case::a_config_the_native_app_cannot_be_built_from(
+        "general_settings:\n  coordination_redis:\n    host: coord\n    port: not-a-port\n",
+        "configuration"
+    )]
     #[tokio::test]
-    async fn python_answers_every_request_of_a_config_the_native_app_cannot_be_built_from() {
+    async fn python_answers_every_request_of_a_config_the_native_app_does_not_run(
+        #[case] settings: &str,
+        #[case] why: &str,
+    ) {
         litellm_gateway::install_crypto_provider();
-        let config = Config::from_yaml(
-            "model_list:\n  - model_name: claude\n    litellm_params:\n      model: anthropic/claude-haiku-5-5\ngeneral_settings:\n  master_key: gateway-key\n  coordination_redis:\n    host: coord\n    port: not-a-port\n",
-        )
+        let config = Config::from_yaml(&format!(
+            "model_list:\n  - model_name: claude\n    litellm_params:\n      model: anthropic/claude-haiku-5-5\n{settings}"
+        ))
         .unwrap();
 
         let (_, state, admit) = native_state(Some(config), &Environment::default())
             .await
             .unwrap();
 
-        assert_eq!(refused(admit).await, Some("configuration"));
+        assert_eq!(refused(admit).await, Some(why));
         state.close().await;
     }
 
