@@ -592,6 +592,7 @@ impl KeyLookup for Counted {
                 expires_at: None,
                 models: Arc::from([]),
                 limits: KeyLimits::default(),
+                priority: None,
             }))
         })
     }

@@ -4031,6 +4031,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "litellm-callbacks",
+ "litellm-callbacks-model-capacity",
  "litellm-callbacks-parallel-request-limiter",
  "litellm-circuit-breaker",
  "litellm-config",

@@ -19,13 +19,14 @@ use litellm_callbacks::{
     Abort, Activation, Callback, Field, FieldSet, Hook, HookInput, HookOutput, Manifest, Outcome,
     Patch, Scalar, Selection, Subscription, UsageRecord, Verdict, typed,
 };
+use litellm_callbacks_model_capacity::RATE_LIMIT_ERROR as CAPACITY_RATE_LIMITED;
 use litellm_callbacks_parallel_request_limiter::{
     AuthMetadata, CapSettings, Descriptor, DescriptorRequest, Engine, EstimateRequest,
     LimiterState, Lookups, OutputCapFacts, ParallelRequestLimiter, PolicyFacts,
     PostCallFailureFacts, PostCallSuccessFacts, PreCallFacts, PythonServed, RATE_LIMITED,
     RateLimitedModel, RequestFacts, Settings as EngineSettings, SuccessFacts, TargetFacts,
     TokenRateLimitType, UsageObject, aggregate_only, charged_tokens, explicit_output_cap,
-    header_map, output_cap, tokens_for_request, write_output_cap,
+    header_map, output_cap, prior_response, tokens_for_request, write_output_cap,
 };
 use litellm_config::{Config, Environment};
 use litellm_gateway_auth::{AuthenticatedRequest, AuthenticationMethod, keys::KeyLimits};
@@ -66,7 +67,39 @@ impl Default for Settings {
     }
 }
 
+/// The proxy's `internal_usage_cache` counters, over the coordination Redis when there is one and
+/// over this process's memory otherwise. A key's limits and a model group's capacity are counted
+/// on the same ones, as they are in the proxy.
+pub fn counters(redis: Option<RedisClient>) -> Arc<RateLimits> {
+    let remote = redis.map(|client| Remote {
+        client,
+        default_ttl: REDIS_DEFAULT_TTL,
+    });
+    Arc::new(RateLimits::new(remote, Some(MEMORY_TTL)))
+}
+
 impl Settings {
+    pub(crate) fn window_size(self) -> i64 {
+        self.window_size
+    }
+
+    pub(crate) fn token_type(self) -> TokenRateLimitType {
+        self.token_type
+    }
+
+    /// The limiter's engine over `counters`, which each limiter builds its own of, as the proxy
+    /// does.
+    pub(crate) fn engine(self, counters: Arc<RateLimits>) -> Engine {
+        Engine::new(
+            counters,
+            EngineSettings {
+                window_size: self.window_size,
+                tpm_reservation_enabled: self.tpm_reservation_enabled,
+            },
+            Arc::new(unix_now),
+        )
+    }
+
     /// The window and the reservation as the environment sets them, and
     /// `general_settings.token_rate_limit_type`.
     pub fn read(config: &Config, environment: &Environment) -> Self {
@@ -151,7 +184,7 @@ fn unix_now() -> f64 {
 
 /// Who Python says the caller is: its `api_key` and its `user_id`.
 pub(crate) struct Caller {
-    api_key: String,
+    pub(crate) api_key: String,
     user_id: Option<&'static str>,
     pub(crate) limits: KeyLimits,
 }
@@ -211,7 +244,7 @@ pub(crate) fn rate_limited(abort: &Abort) -> Option<RateLimited> {
     let error = abort
         .error
         .as_ref()
-        .filter(|error| error.kind == RATE_LIMITED)?;
+        .filter(|error| error.kind == RATE_LIMITED || error.kind == CAPACITY_RATE_LIMITED)?;
     let headers = error
         .fields
         .get("headers")
@@ -223,8 +256,7 @@ pub(crate) fn rate_limited(abort: &Abort) -> Option<RateLimited> {
     })
 }
 
-/// The proxy's `parallel_request_limiter_v3`, over the coordination Redis when there is one and
-/// over this process's memory otherwise, as the proxy's `internal_usage_cache` is.
+/// The proxy's `parallel_request_limiter_v3` over [`counters`].
 pub struct KeyLimiter {
     manifest: Manifest,
     limiter: ParallelRequestLimiter,
@@ -241,7 +273,7 @@ fn manifest() -> Manifest {
         },
         subscriptions: vec![
             Subscription {
-                reads: FieldSet::of(&[Field::Model, Field::RequestBody]),
+                reads: FieldSet::of(&[Field::Model, Field::RequestBody, Field::RateLimitStatuses]),
                 writes: FieldSet::of(&[Field::OptionalParams]),
                 may_abort: true,
                 ..Subscription::on(Hook::PreCall)
@@ -276,22 +308,10 @@ fn written(sent: &Map<String, Value>, capped: Map<String, Value>) -> Map<String,
 }
 
 impl KeyLimiter {
-    pub fn new(settings: Settings, redis: Option<RedisClient>, router: Router) -> Arc<Self> {
-        let remote = redis.map(|client| Remote {
-            client,
-            default_ttl: REDIS_DEFAULT_TTL,
-        });
-        let engine = Engine::new(
-            Arc::new(RateLimits::new(remote, Some(MEMORY_TTL))),
-            EngineSettings {
-                window_size: settings.window_size,
-                tpm_reservation_enabled: settings.tpm_reservation_enabled,
-            },
-            Arc::new(unix_now),
-        );
+    pub fn new(settings: Settings, counters: Arc<RateLimits>, router: Router) -> Arc<Self> {
         Arc::new(Self {
             manifest: manifest(),
-            limiter: ParallelRequestLimiter::new(engine),
+            limiter: ParallelRequestLimiter::new(settings.engine(counters)),
             token_type: settings.token_type,
             router,
         })
@@ -431,7 +451,10 @@ impl KeyLimiter {
             _ => None,
         };
         let mut capped = sent.cloned().map(Value::Object);
-        let facts = self.pre_call_facts(&admission.caller, call_type, model, capped.as_mut());
+        let facts = PreCallFacts {
+            prior_response: prior_response(input)?,
+            ..self.pre_call_facts(&admission.caller, call_type, model, capped.as_mut())
+        };
         if let Some(abort) = self.limiter.pre_call(&admission.state, facts, None).await {
             return Ok(Some(Verdict::Abort(abort)));
         }
@@ -478,6 +501,29 @@ impl KeyLimiter {
             .settle_success(&admission.state, facts, None)
             .await;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+impl KeyLimiter {
+    /// What this process's memory holds of a counter, for a test to read what was counted.
+    pub(crate) fn counted(&self, kind: &str, descriptor: &str, value: &str) -> Option<f64> {
+        use litellm_redis_store::{
+            Number,
+            rate_limits::{Entry, Local, Scope},
+        };
+        let entry = Entry::new(
+            kind,
+            Scope {
+                descriptor: descriptor.into(),
+                value: value.into(),
+            },
+        )
+        .ok()?;
+        match self.limiter.engine().store().get_local(&entry).ok()? {
+            Some(Local::Number(number)) => Some(Number::as_f64(number)),
+            _ => None,
+        }
     }
 }
 
@@ -580,34 +626,20 @@ mod tests {
 
     use axum::{
         Router,
-        body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
-        middleware::from_fn_with_state,
+        body::to_bytes,
+        http::{StatusCode, header},
         response::Response,
     };
     use litellm_gateway_auth::{
-        authenticate, hash_token,
+        hash_token,
         keys::{KeyHash, KeyLookup, KeyStatus, LookupFuture, ModelLimits},
     };
-    use litellm_redis_store::{
-        Number,
-        rate_limits::{Entry, Local, Scope},
-    };
     use rstest::rstest;
-    use tower::ServiceExt;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{body_partial_json, method},
-    };
 
     use super::*;
-    use crate::{AppState, middleware};
+    use crate::test_support::{self, MASTER_KEY, Served, asking, send_as};
 
-    const MASTER_KEY: &str = "sk-master";
     const KEY: &str = "sk-limited";
-    /// 8 input, 14 output, 100 read from cache and 5 written to it, which Python charges as 27.
-    const USAGE: &str = r#"{"input_tokens":8,"output_tokens":14,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}"#;
-
     struct Holding(KeyLimits);
 
     impl KeyLookup for Holding {
@@ -617,103 +649,9 @@ mod tests {
                     expires_at: None,
                     models: Arc::from([]),
                     limits: self.0.clone(),
+                    priority: None,
                 }))
             })
-        }
-    }
-
-    /// The provider every deployment but `broken` calls: it answers a stream when asked for one,
-    /// and a complete message otherwise, each with [`USAGE`].
-    async fn provider() -> MockServer {
-        let upstream = MockServer::start().await;
-        let stream = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"usage\":{\"input_tokens\":8,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":14}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        );
-        Mock::given(method("POST"))
-            .and(body_partial_json(json!({"stream": true})))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
-            .mount(&upstream)
-            .await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                format!(
-                    r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{{"type":"text","text":"hi"}}],"stop_reason":"end_turn","usage":{USAGE}}}"#
-                ),
-                "application/json",
-            ))
-            .mount(&upstream)
-            .await;
-        upstream
-    }
-
-    /// The inference routes as the gateway mounts them, for a key holding `limits`: the groups
-    /// `claude` (also asked for as `sonnet`) and `gpt` answer, and `broken` is refused upstream.
-    struct Served {
-        app: Router,
-        limiter: Arc<KeyLimiter>,
-        upstream: MockServer,
-        _refusing: MockServer,
-    }
-
-    async fn served(limits: KeyLimits) -> Served {
-        configured(limits, "").await
-    }
-
-    async fn configured(limits: KeyLimits, general_settings: &str) -> Served {
-        let upstream = provider().await;
-        let refusing = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(400).set_body_json(json!({"type": "error",
-                "error": {"type": "invalid_request_error", "message": "refused upstream"}})),
-            )
-            .mount(&refusing)
-            .await;
-        let deployment = |name: &str, base: &str| {
-            format!(
-                "  - model_name: {name}\n    litellm_params: {{model: anthropic/{name}-test, api_base: \"{base}\", api_key: sk-upstream}}\n"
-            )
-        };
-        let config = Config::from_yaml(&format!(
-            "model_list:\n{}{}{}router_settings:\n  model_group_alias: {{sonnet: claude}}\ngeneral_settings:\n  master_key: {MASTER_KEY}\n{general_settings}",
-            deployment("claude", &upstream.uri()),
-            deployment("gpt", &upstream.uri()),
-            deployment("broken", &refusing.uri()),
-        ))
-        .unwrap();
-        let state = AppState {
-            keys: Some(Arc::new(Holding(limits))),
-            ..AppState::build(&config, &Environment::default())
-                .await
-                .unwrap()
-        };
-        let app = middleware::rate_limited(
-            litellm_gateway_inference::router(state.inference.clone()),
-            state.key_limiter.clone(),
-        )
-        .route_layer(from_fn_with_state(state.auth(&config), authenticate));
-        Served {
-            app,
-            limiter: state.key_limiter.clone(),
-            upstream,
-            _refusing: refusing,
-        }
-    }
-
-    fn charged_to(limiter: &KeyLimiter, descriptor: &str, value: &str) -> Option<f64> {
-        let entry = Entry::new(
-            "tokens",
-            Scope {
-                descriptor: descriptor.into(),
-                value: value.into(),
-            },
-        )
-        .unwrap();
-        match limiter.limiter.engine().store().get_local(&entry).unwrap() {
-            Some(Local::Number(number)) => Some(Number::as_f64(number)),
-            _ => None,
         }
     }
 
@@ -733,18 +671,6 @@ mod tests {
         charged_to(limiter, descriptor, value)
     }
 
-    /// A body asking `model` for at most `max_tokens`, whose prompt is estimated at one token.
-    fn asking(model: &str, max_tokens: Option<u64>) -> Value {
-        let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
-        match (body, max_tokens) {
-            (Value::Object(mut body), Some(max_tokens)) => {
-                body.insert("max_tokens".to_owned(), json!(max_tokens));
-                Value::Object(body)
-            }
-            (body, _) => body,
-        }
-    }
-
     fn complete() -> Value {
         asking("claude", Some(16))
     }
@@ -758,19 +684,6 @@ mod tests {
         asking("broken", Some(16))
     }
 
-    async fn send_as(app: &Router, token: &str, body: Value) -> Response {
-        app.clone()
-            .oneshot(
-                Request::post("/v1/messages")
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
     async fn send(app: &Router, body: Value) -> Response {
         send_as(app, KEY, body).await
     }
@@ -782,6 +695,19 @@ mod tests {
                 .map(|(model, limit)| ((*model).to_owned(), *limit))
                 .collect(),
         )
+    }
+
+    async fn served(limits: KeyLimits) -> Served {
+        configured(limits, "").await
+    }
+
+    /// The gateway for a key holding `limits`, with `general_settings` set besides its master key.
+    async fn configured(limits: KeyLimits, general_settings: &str) -> Served {
+        test_support::served(Arc::new(Holding(limits)), general_settings, "").await
+    }
+
+    fn charged_to(limiter: &KeyLimiter, descriptor: &str, value: &str) -> Option<f64> {
+        limiter.counted("tokens", descriptor, value)
     }
 
     async fn json_body(response: Response) -> Value {

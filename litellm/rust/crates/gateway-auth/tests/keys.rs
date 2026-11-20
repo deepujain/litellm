@@ -80,6 +80,7 @@ fn expiring(at: Option<u64>) -> Option<KeyStatus> {
         expires_at: at.map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
         models: Arc::from([]),
         limits: KeyLimits::default(),
+        priority: None,
     })
 }
 
@@ -137,6 +138,7 @@ async fn an_active_virtual_keys_limits_reach_its_caller_and_the_master_key_has_n
         expires_at: None,
         models: Arc::from([]),
         limits: limits.clone(),
+        priority: None,
     })));
 
     let key = auth
@@ -238,6 +240,7 @@ async fn a_key_with_a_model_list_may_call_only_what_the_proxy_lets_it(
         expires_at: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         limits: KeyLimits::default(),
+        priority: None,
     }));
     let identity = auth(keys)
         .authenticate(&SecretValue::new(VIRTUAL_KEY))

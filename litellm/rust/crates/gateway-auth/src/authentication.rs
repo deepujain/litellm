@@ -294,6 +294,7 @@ impl Authenticator for KeyAuthenticator {
                     expires_at,
                     models,
                     limits,
+                    priority,
                 }) => Ok(VerifiedIdentity {
                     principal: Principal::new(
                         VIRTUAL_KEY.into(),
@@ -306,6 +307,7 @@ impl Authenticator for KeyAuthenticator {
                         credential_id: hash.as_str().into(),
                         expires_at,
                         limits,
+                        priority,
                     },
                     restrictions: match models.is_empty() {
                         true => Permissions::All,
@@ -327,6 +329,7 @@ fn master_identity() -> VerifiedIdentity {
             credential_id: "master".into(),
             expires_at: None,
             limits: KeyLimits::default(),
+            priority: None,
         },
         restrictions: Permissions::All,
     }

@@ -49,6 +49,9 @@ pub enum KeyStatus {
         expires_at: Option<SystemTime>,
         models: Arc<[String]>,
         limits: KeyLimits,
+        /// The priority class the key's `metadata.priority` names, which reserves it a share of
+        /// a model group's capacity.
+        priority: Option<Arc<str>>,
     },
     Revoked,
 }

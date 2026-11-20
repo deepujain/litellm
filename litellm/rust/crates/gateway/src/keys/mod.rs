@@ -197,7 +197,8 @@ fn carried(key: &KeyView) -> Option<&'static str> {
 }
 
 /// The `metadata` the native app honors: the key's own limit for each model it names one for,
-/// which `/key/generate` stores from `model_rpm_limit` and `model_tpm_limit`.
+/// which `/key/generate` stores from `model_rpm_limit` and `model_tpm_limit`, and the priority
+/// class `dynamic_rate_limiter_v3` counts the key under, when it is written as text.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Metadata {
@@ -205,6 +206,7 @@ struct Metadata {
     model_rpm_limit: BTreeMap<String, i64>,
     #[serde(default)]
     model_tpm_limit: BTreeMap<String, i64>,
+    priority: Option<String>,
 }
 
 impl Metadata {
@@ -242,6 +244,7 @@ fn status(key: &KeyView, also: Option<&'static str>) -> Result<KeyStatus, &'stat
             model_rpm: ModelLimits::new(metadata.model_rpm_limit),
             model_tpm: ModelLimits::new(metadata.model_tpm_limit),
         },
+        priority: metadata.priority.map(Arc::from),
     })
 }
 
@@ -425,6 +428,7 @@ mod tests {
                     .map(|second| SystemTime::UNIX_EPOCH + Duration::from_secs(second)),
                 models: models.iter().map(|model| (*model).to_owned()).collect(),
                 limits: KeyLimits::default(),
+                priority: None,
             })
         );
     }
@@ -462,6 +466,19 @@ mod tests {
                 ..KeyLimits::default()
             })
         );
+    }
+
+    #[rstest]
+    fn a_keys_metadata_priority_is_the_class_it_is_counted_under() {
+        let key = KeyView {
+            metadata: json(r#"{"priority":"prod"}"#),
+            ..plain()
+        };
+
+        let Ok(KeyStatus::Active { priority, .. }) = status(&key, None) else {
+            panic!("the key is active");
+        };
+        assert_eq!(priority.as_deref(), Some("prod"));
     }
 
     #[rstest]
@@ -527,6 +544,7 @@ mod tests {
     #[case::metadata_beside_a_model_limit(|key: &mut KeyView| key.metadata = json(r#"{"model_rpm_limit":{"claude":2},"tags":["a"]}"#), "metadata")]
     #[case::a_model_limit_that_is_no_whole_number(|key: &mut KeyView| key.metadata = json(r#"{"model_tpm_limit":{"claude":"100"}}"#), "metadata")]
     #[case::model_limits_that_are_no_map(|key: &mut KeyView| key.metadata = json(r#"{"model_rpm_limit":5}"#), "metadata")]
+    #[case::a_priority_that_is_no_text(|key: &mut KeyView| key.metadata = json(r#"{"priority":5}"#), "metadata")]
     #[case::max_budget(|key: &mut KeyView| key.max_budget = Some(5.0), "max_budget")]
     #[case::soft_budget(|key: &mut KeyView| key.soft_budget = Some(5.0), "soft_budget")]
     #[case::budget_duration(|key: &mut KeyView| key.budget_duration = Some("30d".to_owned()), "budget_duration")]

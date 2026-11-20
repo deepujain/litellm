@@ -282,6 +282,7 @@ mod tests {
                         expires_at: None,
                         models: Arc::from([]),
                         limits: KeyLimits::default(),
+                        priority: None,
                     })),
                     Self::Revoked => Ok(Some(KeyStatus::Revoked)),
                     Self::Restricted => Err(litellm_gateway_auth::Error::Forbidden),
