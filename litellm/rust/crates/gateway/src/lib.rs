@@ -6,6 +6,7 @@ mod error;
 mod health;
 pub mod host;
 mod keys;
+mod latest_aliases;
 mod license;
 pub mod middleware;
 mod redis;
@@ -19,6 +20,7 @@ pub use callbacks::{
     parallel_request_limiter::{self, KeyLimiter},
 };
 pub use error::Error;
+use latest_aliases::LatestAliases;
 pub use redis::RedisClients;
 pub use resources::Resources;
 pub use state::AppState;
@@ -83,6 +85,7 @@ pub async fn build_inference(
         parallel_request_limiter::Settings::read(config, environment),
         redis.coordination.clone(),
         router.clone(),
+        LatestAliases::of(&catalog),
     );
     let callbacks = Callbacks::new(vec![key_limiter.registered()])?;
     let gateway = Gateway::new(
