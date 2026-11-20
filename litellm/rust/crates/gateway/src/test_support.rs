@@ -72,6 +72,16 @@ pub(crate) async fn served(
     general_settings: &str,
     litellm_settings: &str,
 ) -> Served {
+    serving(keys, general_settings, litellm_settings, "").await
+}
+
+/// [`served`], with `more_models` as further entries of its `model_list`.
+pub(crate) async fn serving(
+    keys: Arc<dyn KeyLookup>,
+    general_settings: &str,
+    litellm_settings: &str,
+    more_models: &str,
+) -> Served {
     let upstream = provider().await;
     let refusing = MockServer::start().await;
     Mock::given(method("POST"))
@@ -87,7 +97,7 @@ pub(crate) async fn served(
         )
     };
     let config = Config::from_yaml(&format!(
-        "model_list:\n{}{}{}router_settings:\n  model_group_alias: {{sonnet: claude}}\nenvironment_variables:\n  LITELLM_LICENSE: any\ngeneral_settings:\n  master_key: {MASTER_KEY}\n{general_settings}{litellm_settings}",
+        "model_list:\n{}{}{}{more_models}router_settings:\n  model_group_alias: {{sonnet: claude}}\nenvironment_variables:\n  LITELLM_LICENSE: any\ngeneral_settings:\n  master_key: {MASTER_KEY}\n{general_settings}{litellm_settings}",
         deployment("claude", &upstream.uri(), ", rpm: 10, tpm: 100000"),
         deployment("gpt", &upstream.uri(), ""),
         deployment("broken", &refusing.uri(), ""),
