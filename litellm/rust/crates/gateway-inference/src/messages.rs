@@ -16,7 +16,9 @@ use litellm_host_http::Sse;
 use litellm_inference_messages::{
     MessagesBody, MessagesCall, MessagesRoute, MessagesShaping, messages_body, route::Messages,
 };
-use litellm_llms_types::formats::messages::MessagesOptionalParams;
+use litellm_llms_types::formats::messages::{
+    MessagesOptionalParams, streaming::MessagesStreamUsage,
+};
 use litellm_llms_types::headers::{ProviderSpecificHeader, ProviderSpecificHeaders};
 use litellm_router_core::{Attempt, Deployment, Op, Served};
 use serde_json::{Map, Value};
@@ -25,10 +27,11 @@ use crate::{
     Ended, Error, Gateway, JsonObject, RequestId,
     caching::CacheHeaders,
     headers::Routing,
+    hooks::{self, CallHooks, Served as ServedCall},
     model_restamp::{ReportedModel, Stamp},
     request,
     routing::{self, Host, RouteAttempt, RouteChunks},
-    stream_event::{self, Read},
+    stream_event::{self, Counts, Read},
     stream_outcome::{self, Streamed},
 };
 
@@ -41,6 +44,9 @@ const OPENROUTER_API_HEADERS: [&str; 2] = [
 const ANTHROPIC_API_HEADER_PROVIDERS: &str =
     "anthropic,bedrock,bedrock_mantle,vertex_ai,openrouter,deepseek";
 const TOOLS: &str = "tools";
+const PATH: &str = "/v1/messages";
+/// Python's `call_type` for this route.
+const CALL_TYPE: &str = "anthropic_messages";
 
 pub async fn create<H: Host>(
     State(gateway): State<Arc<Gateway<H>>>,
@@ -68,6 +74,19 @@ async fn handle<H: Host>(
     headers: &HeaderMap,
     body: Map<String, Value>,
 ) -> Result<Response, Ended> {
+    hooks::around(gateway, identity, CALL_TYPE, body, |hooks, body| {
+        serve(gateway, identity, headers, hooks, body)
+    })
+    .await
+}
+
+async fn serve<H: Host>(
+    gateway: &Gateway<H>,
+    identity: &AuthenticatedRequest,
+    headers: &HeaderMap,
+    hooks: Arc<H::Hooks>,
+    body: Map<String, Value>,
+) -> Result<Response, Ended> {
     let model = request::model(&body)?.to_owned();
     let (body, cache_options) = crate::caching::prepare(identity, body)?;
     let route = gateway.messages.clone();
@@ -89,19 +108,56 @@ async fn handle<H: Host>(
         gateway,
         identity,
         Op::ANTHROPIC_MESSAGES,
-        "/v1/messages",
+        PATH,
         &model,
         &attempt,
     )
     .await?;
     let routing = Routing::served(&routed);
     let reported = ReportedModel::of(&model, &routed);
+    let model_group = routed.name.clone();
     let (ran, cache) = routed.output.response;
+    let served = {
+        let model = model.clone();
+        move |usage| ServedCall {
+            model: model.clone(),
+            model_group: model_group.clone(),
+            usage,
+        }
+    };
+    let complete = match &ran {
+        CallOutput::Complete(body) => {
+            hooks.post_call_success().await?;
+            Some(served(complete_counts(body).map(Counts::usage)))
+        }
+        CallOutput::Stream { .. } => None,
+    };
+    let added = hooks.response_headers().await;
+    let ran = hooks::told_when_it_ends(
+        ran,
+        hooks.clone(),
+        stream_event::messages_event,
+        move |counts: Counts| served(Some(counts.usage())),
+    );
     let stream =
         Sse::<Messages, _, _>::new(Json, |error| Bytes::from(Error::from(error).sse_frame()));
     let ran = reported.stream(reported.complete(ran), message_start);
     let response = litellm_host_http::render(stream, stream_outcome::bytes(ran))?;
-    Ok((Extension(routing), cache.apply(response)).into_response())
+    if let Some(served) = complete {
+        hooks::log(&hooks, served);
+    }
+    Ok((Extension(routing), added, cache.apply(response)).into_response())
+}
+
+/// What a complete answer's `usage` counts.
+fn complete_counts(body: &MessagesBody) -> Option<Counts> {
+    let usage = match body {
+        MessagesBody::Message(message) => message.usage.as_ref(),
+        MessagesBody::Unchecked(fields) => fields.get("usage"),
+    }?;
+    serde_json::from_value::<MessagesStreamUsage>(usage.clone())
+        .ok()
+        .map(Counts::from)
 }
 
 /// Where a Messages stream names its model: the `message_start` event, the first one that is

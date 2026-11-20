@@ -10,8 +10,9 @@ use axum::{
     response::Response,
 };
 use futures_util::future::BoxFuture;
+use litellm_callbacks::ErasedCallback;
 use litellm_gateway::{
-    Gateway,
+    Callbacks, Gateway,
     host::{FACTS, NativeHost},
 };
 use litellm_gateway_inference::router;
@@ -105,6 +106,22 @@ pub fn app_with_shaping(
     )
 }
 
+/// The app with `callbacks` run around each call, in the order given.
+pub fn app_with_callbacks(
+    model: &str,
+    api_base: &str,
+    callbacks: Vec<Arc<dyn ErasedCallback>>,
+) -> Router {
+    hosted_app(
+        test_params(model, api_base),
+        Value::Object(Map::new()),
+        litellm_gateway_auth::Permissions::All,
+        None,
+        None,
+        NativeHost::new(Arc::new(Callbacks::new(callbacks).unwrap())),
+    )
+}
+
 fn test_params(model: &str, api_base: &str) -> Map<String, Value> {
     json!({"model": model, "api_base": api_base, "api_key": "test-key", "timeout": 5})
         .as_object()
@@ -135,6 +152,24 @@ fn deployment_app(
     cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
     principal: Option<litellm_gateway_auth::Principal>,
 ) -> Router {
+    hosted_app(
+        litellm_params,
+        shaping,
+        permissions,
+        cache,
+        principal,
+        NativeHost::default(),
+    )
+}
+
+fn hosted_app(
+    litellm_params: Map<String, Value>,
+    shaping: Value,
+    permissions: litellm_gateway_auth::Permissions,
+    cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
+    principal: Option<litellm_gateway_auth::Principal>,
+    host: NativeHost,
+) -> Router {
     let pool = Arc::new(HttpClientPool::new(Arc::new(PublicDnsResolver)));
     let http = Resolution::from(&HttpSettings::default()).config;
     let secrets = Arc::new(NoSecrets);
@@ -162,7 +197,7 @@ fn deployment_app(
         secrets,
         models,
         HashMap::from([(id, serde_json::from_value(shaping).unwrap())]),
-        NativeHost,
+        host,
     )
     .unwrap();
     let gateway = match cache {

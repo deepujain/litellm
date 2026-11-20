@@ -19,6 +19,7 @@ use crate::{
     Ended, Error, Gateway, JsonObject,
     caching::CacheHeaders,
     headers::Routing,
+    hooks::{self, Served as ServedCall},
     model_restamp::ReportedModel,
     request::{self, Path},
     routing::{self, Host, RouteAttempt},
@@ -48,9 +49,24 @@ pub(crate) async fn create_from_model_path<H: Host>(
     handle(&gateway, &identity, body).await
 }
 
+/// Python's `call_type` for this route.
+const CALL_TYPE: &str = "acompletion";
+
 async fn handle<H: Host>(
     gateway: &Gateway<H>,
     identity: &AuthenticatedRequest,
+    body: Map<String, Value>,
+) -> Result<Response, Ended> {
+    hooks::around(gateway, identity, CALL_TYPE, body, |hooks, body| {
+        serve(gateway, identity, hooks, body)
+    })
+    .await
+}
+
+async fn serve<H: Host>(
+    gateway: &Gateway<H>,
+    identity: &AuthenticatedRequest,
+    hooks: Arc<H::Hooks>,
     body: Map<String, Value>,
 ) -> Result<Response, Ended> {
     let model = request::model(&body)?.to_owned();
@@ -80,12 +96,19 @@ async fn handle<H: Host>(
     .await?;
     let routing = Routing::served(&routed);
     let reported = ReportedModel::of(&model, &routed);
+    let model_group = routed.name.clone();
     let (response, cache) = routed.output.response;
-    Ok((
+    let served = ServedCall {
+        model: model.clone(),
+        model_group,
+        usage: Some(response.usage.clone()),
+    };
+    let response = (
         Extension(routing),
         cache.apply(Json(reported.complete(response)).into_response()),
     )
-        .into_response())
+        .into_response();
+    hooks::complete(&hooks, served, response).await
 }
 
 struct ChatAttempt<'a, H> {

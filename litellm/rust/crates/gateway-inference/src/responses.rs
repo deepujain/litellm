@@ -18,20 +18,41 @@ use crate::{
     Ended, Error, Gateway, JsonObject,
     caching::CacheHeaders,
     headers::Routing,
+    hooks::{self, CallHooks, Served as ServedCall},
     model_restamp::ReportedModel,
     request,
     routing::{self, Host, RouteAttempt},
-    stream_event,
+    stream_event::{self, Counts},
     stream_outcome::{self, Streamed},
 };
+
+/// Python's `call_type` for this route.
+const CALL_TYPE: &str = "aresponses";
 
 pub(crate) async fn create<H: Host>(
     State(gateway): State<Arc<Gateway<H>>>,
     identity: AuthenticatedRequest,
     JsonObject(body): JsonObject,
 ) -> Result<Response, Ended> {
+    hooks::around(&gateway, &identity, CALL_TYPE, body, |hooks, body| {
+        serve(&gateway, &identity, hooks, body)
+    })
+    .await
+}
+
+/// What a complete answer's `usage` counts.
+fn complete_counts(usage: Option<&Value>) -> Option<Counts> {
+    serde_json::from_value(usage?.clone()).ok()
+}
+
+async fn serve<H: Host>(
+    gateway: &Gateway<H>,
+    identity: &AuthenticatedRequest,
+    hooks: Arc<H::Hooks>,
+    body: Map<String, Value>,
+) -> Result<Response, Ended> {
     let model = request::model(&body)?.to_owned();
-    let (body, cache_options) = crate::caching::prepare(&identity, body)?;
+    let (body, cache_options) = crate::caching::prepare(identity, body)?;
     let route = gateway.responses.clone();
     let route = match &gateway.cache {
         Some(cache) => route.with_cache(litellm_cache_response::ScopedCache::new(
@@ -41,14 +62,14 @@ pub(crate) async fn create<H: Host>(
         None => route,
     };
     let attempt = ResponsesAttempt {
-        gateway: &gateway,
+        gateway,
         route,
         body,
         policy: cache_options.policy,
     };
     let routed = routing::call(
-        &gateway,
-        &identity,
+        gateway,
+        identity,
         Op::RESPONSES,
         "/responses",
         &model,
@@ -57,13 +78,38 @@ pub(crate) async fn create<H: Host>(
     .await?;
     let routing = Routing::served(&routed);
     let reported = ReportedModel::of(&model, &routed);
+    let served = {
+        let (model, model_group) = (model.clone(), routed.name.clone());
+        move |counts: Option<Counts>| ServedCall {
+            model: model.clone(),
+            model_group: model_group.clone(),
+            usage: counts.map(Counts::responses_usage),
+        }
+    };
     let (ran, cache) = routed.output.response;
+    let complete = match &ran {
+        CallOutput::Complete(response) => {
+            hooks.post_call_success().await?;
+            Some(served(complete_counts(response.extra.get("usage"))))
+        }
+        CallOutput::Stream { .. } => None,
+    };
+    let added = hooks.response_headers().await;
+    let ran = hooks::told_when_it_ends(
+        ran,
+        hooks.clone(),
+        stream_event::responses_event,
+        move |counts| served(Some(counts)),
+    );
     let stream = Sse::<Responses, _, _>::new(Json, |error| {
         Bytes::from(Error::from(error).responses_sse_frame())
     });
     let ran = stream_outcome::bytes(reported.complete(ran));
     let response = litellm_host_http::render(stream, ran)?;
-    Ok((Extension(routing), cache.apply(response)).into_response())
+    if let Some(served) = complete {
+        hooks::log(&hooks, served);
+    }
+    Ok((Extension(routing), added, cache.apply(response)).into_response())
 }
 
 struct ResponsesAttempt<'a, H> {
